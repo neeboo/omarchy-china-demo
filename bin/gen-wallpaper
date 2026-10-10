@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# gen-wallpaper — live-demo loop: text prompt -> h3 render on the DGX farm ->
+# pull back -> (optionally) make it a seamless loop -> push to a wallpaper box.
+#
+# usage:
+#   gen-wallpaper "a koi pond ..."                  # T2VA + crossfade loop, ~8-10 min
+#   gen-wallpaper "..." --keyframe kf.png           # FL2VA: first==last frame -> seam ~0
+#                                                   #   (skips crossfade; needs no loop pass)
+#   gen-wallpaper "..." --dur 8                     # duration 2-15 s (default 10)
+#   gen-wallpaper "..." --ratio 9:16                # for portrait monitors
+#   gen-wallpaper "..." --no-loop                   # skip the crossfade-loop pass
+#   gen-wallpaper "..." --push user@omarchy-box     # scp + start on the box
+#
+# Loop strategy: a raw T2VA output rarely ends on its opening frame (measured
+# seam p99 ~113-131/255 across seeds), so the default pass crossfades the tail
+# into the head. With --keyframe, the job goes out as FL2VA with
+# first_frame == last_frame — the model is constrained to return to the
+# opening image, so the loop is seamless by construction and the crossfade
+# pass is skipped automatically.
+set -euo pipefail
+
+DGX=${DGX_SSH:-dgx_spark}
+FARM_DIR=/home/spark/h3_factory
+LOCAL_DIR="$HOME/dev/omarchy-china-demo/assets"
+PROMPT="" DUR=10 RATIO="16:9" PUSH="" DO_LOOP=1 TIMEOUT=1500 KEYFRAME=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dur) DUR="$2"; shift 2 ;;
+    --ratio) RATIO="$2"; shift 2 ;;
+    --push) PUSH="$2"; shift 2 ;;
+    --no-loop) DO_LOOP=0; shift ;;
+    --keyframe) KEYFRAME="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    *) PROMPT="$1"; shift ;;
+  esac
+done
+[ -n "$PROMPT" ] || { grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+mkdir -p "$LOCAL_DIR"
+
+STAMP=$(date +%H%M%S)
+ID="wp_${STAMP}_$RANDOM"
+PROJECT="omarchy-demo"
+JQ_PROMPT=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$PROMPT")
+
+EXTRA_FIELDS=""
+if [ -n "$KEYFRAME" ]; then
+  [ -f "$KEYFRAME" ] || { echo "no such keyframe: $KEYFRAME" >&2; exit 1; }
+  KF_REMOTE="$FARM_DIR/inbox/kf_${ID}.png"
+  scp -q "$KEYFRAME" "$DGX:$KF_REMOTE"
+  DO_LOOP=0   # FL2VA returns to its opening frame; no crossfade needed
+  EXTRA_FIELDS=", \"first_frame\": \"$KF_REMOTE\", \"last_frame\": \"$KF_REMOTE\",
+ \"extra_lora\": \"Motion_Repair.safetensors\", \"extra_lora_strength\": 0.9"
+  echo "[gen] FL2VA mode: keyframe -> $KF_REMOTE (first==last, seam ~0 by construction)"
+fi
+
+echo "[gen] queuing $ID (h3-fast-12, ${DUR}s, $RATIO) ..."
+ssh "$DGX" "cat > $FARM_DIR/inbox/60_${ID}.jsonl" <<EOF
+{"id": "$ID", "project": "$PROJECT", "prompt": $JQ_PROMPT, "model": "h3-fast-12",
+ "mp": 0.7, "dur": $DUR, "ratio": "$RATIO", "seed": $RANDOM$RANDOM, "raw": true, "sheet": false$EXTRA_FIELDS}
+EOF
+
+echo "[gen] waiting for render (poll every 30 s, timeout ${TIMEOUT}s) ..."
+ELAPSED=0
+while true; do
+  sleep 30; ELAPSED=$((ELAPSED + 30))
+  DONE=$(ssh "$DGX" "ls $FARM_DIR/out/ 2>/dev/null | grep -F '${PROJECT}_${ID}_' | grep '\.mp4$' | head -1" || true)
+  [ -n "$DONE" ] && break
+  if ssh "$DGX" "grep -E 'REJECT|FAIL' $FARM_DIR/worker.log | grep -q '$ID'" 2>/dev/null; then
+    echo "[gen] FAILED on farm — check worker.log for $ID" >&2; exit 2
+  fi
+  [ "$ELAPSED" -ge "$TIMEOUT" ] && { echo "[gen] TIMEOUT after ${TIMEOUT}s" >&2; exit 3; }
+  echo "[gen]   ... ${ELAPSED}s"
+done
+echo "[gen] rendered: $DONE (${ELAPSED}s)"
+
+RAW="$LOCAL_DIR/${ID}_raw.mp4"
+scp -q "$DGX:$FARM_DIR/out/$DONE" "$RAW"
+echo "[gen] pulled -> $RAW"
+open -R "$RAW"   # reveal in Finder immediately (ship-renders rule)
+
+if [ "$DO_LOOP" = "1" ]; then
+  FADE=0.75
+  TOTAL=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$RAW")
+  OUT="$LOCAL_DIR/${ID}_loop.mp4"
+  ffmpeg -y -v error -i "$RAW" -filter_complex \
+    "[0:v]split=3[a][b][c]; \
+     [a]trim=end=${TOTAL}-${FADE},setpts=PTS-STARTPTS[main]; \
+     [b]trim=start=${TOTAL}-${FADE},setpts=PTS-STARTPTS[tail]; \
+     [c]trim=end=${FADE},setpts=PTS-STARTPTS[head]; \
+     [tail][head]xfade=transition=fade:duration=${FADE}:offset=0[blend]; \
+     [blend][main]concat=n=2:v=1:a=0[out]" \
+    -map "[out]" -an -c:v libx264 -crf 18 -pix_fmt yuv420p "$OUT"
+  echo "[gen] seamless loop -> $OUT"
+  open "$OUT"
+else
+  OUT="$RAW"
+fi
+
+if [ -n "$PUSH" ]; then
+  ssh "$PUSH" 'mkdir -p ~/Videos/wallpapers' 2>/dev/null || true
+  scp -q "$OUT" "$PUSH:Videos/wallpapers/"
+  ssh "$PUSH" "koi-wallpaper on ~/Videos/wallpapers/$(basename "$OUT")" \
+    && echo "[gen] LIVE on $PUSH" \
+    || echo "[gen] pushed to $PUSH — run: koi-wallpaper on ~/Videos/wallpapers/$(basename "$OUT")"
+fi

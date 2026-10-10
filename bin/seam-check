@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# seam-check — measure how well a video's last frame matches its first frame.
+#
+#   seam-check video.mp4
+#
+# Prints mean/p95/p99/max of the per-pixel gray difference (0-255 scale).
+# p99 < 15 reads as seamless; T2VA direct outputs typically land 100+.
+#
+# NOTE: frames are grabbed BY INDEX (select=eq(n,...)), never by -ss timestamp:
+# seeking past the final frame's pts silently falls back to frame 0 and
+# reports a fake-perfect seam.
+set -euo pipefail
+V="$1"
+[ -f "$V" ] || { echo "no such video: $V" >&2; exit 1; }
+
+N=$(ffprobe -v error -select_streams v:0 -count_frames \
+  -show_entries stream=nb_read_frames -of csv=p=0 "$V")
+LAST=$((N - 1))
+
+ffmpeg -y -v error -i "$V" -vf "select='eq(n,0)'" -frames:v 1 /tmp/seam_head.png
+ffmpeg -y -v error -i "$V" -vf "select='eq(n,${LAST})'" -frames:v 1 /tmp/seam_tail.png
+ffmpeg -v error -i /tmp/seam_head.png -i /tmp/seam_tail.png \
+  -filter_complex "blend=all_mode=difference,format=gray" \
+  -f rawvideo -pix_fmt gray -y /tmp/seam_diff.raw
+
+python3 - "$N" <<'PY'
+import sys
+d = open('/tmp/seam_diff.raw', 'rb').read()
+n = len(d)
+srt = sorted(d)
+print(f"frames={sys.argv[1]}  seam: mean={sum(d)/n:.2f}  p95={srt[int(n*.95)]}  "
+      f"p99={srt[int(n*.99)]}  max={srt[-1]}  (of 255)")
+PY

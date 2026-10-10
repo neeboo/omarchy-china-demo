@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# koi-wallpaper — seamless-loop video wallpaper for Omarchy (Hyprland/Wayland)
+# Self-contained; no config-file surgery. mpvpaper renders the video on a
+# layer-shell surface beneath your windows; stopping restores the static
+# wallpaper. Designed to play h3-generated loop assets from the demo pack.
+#
+# usage:
+#   koi-wallpaper on <video.mp4> [monitor ...]   # start on all (or listed) monitors
+#   koi-wallpaper off                            # stop and restore static wallpaper
+#   koi-wallpaper toggle <video.mp4> [monitor ...]
+#   koi-wallpaper status
+set -euo pipefail
+
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/koi-wallpaper"
+mkdir -p "$STATE_DIR"
+
+mons_all() {
+  if command -v jq >/dev/null 2>&1; then
+    hyprctl monitors -j | jq -r '.[].name'
+  else
+    # fallback: parse "Monitor eDP-1 (ID 0)" lines from plain text output
+    hyprctl monitors | sed -n 's/^Monitor \([^ ]*\) (ID .*/\1/p'
+  fi
+}
+
+running() { pgrep -x mpvpaper >/dev/null 2>&1; }
+
+do_off() {
+  local killed=0
+  for pidfile in "$STATE_DIR"/*.pid; do
+    [ -f "$pidfile" ] || continue
+    kill "$(cat "$pidfile")" 2>/dev/null && killed=1
+    rm -f "$pidfile"
+  done
+  if running; then pkill -x mpvpaper && killed=1; fi
+  if [ "$killed" = "1" ]; then
+    echo "koi-wallpaper OFF (static wallpaper restored)"
+  else
+    echo "koi-wallpaper: not running"
+  fi
+}
+
+do_on() {
+  local video="$1"; shift
+  [ -f "$video" ] || { echo "no such video: $video" >&2; exit 1; }
+  video="$(readlink -f "$video")"
+  local mons=("$@")
+  [ ${#mons[@]} -eq 0 ] && mapfile -t mons < <(mons_all)
+  [ ${#mons[@]} -gt 0 ] || { echo "no monitors found" >&2; exit 1; }
+  do_off >/dev/null
+  for m in "${mons[@]}"; do
+    nohup mpvpaper -o "loop mute=yes panscan=1.0 hwdec=auto" "$m" "$video" \
+      >"$STATE_DIR/$m.log" 2>&1 &
+    echo $! >"$STATE_DIR/$m.pid"
+  done
+  echo "koi-wallpaper ON  monitors=[${mons[*]}]  video=$video"
+}
+
+case "${1:-}" in
+  on) shift; do_on "$@" ;;
+  off) do_off ;;
+  toggle) shift; if running; then do_off; else do_on "$@"; fi ;;
+  status) if running; then echo "RUNNING: $(pgrep -ax mpvpaper | tr '\n' ' ')"; else echo "STOPPED"; fi ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac
