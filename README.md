@@ -10,7 +10,27 @@ bin/koi-wallpaper    # omarchy 机器端:mpvpaper 播放/停止/切换(自研,�
 bin/gen-wallpaper    # Mac 端现场生成闭环:prompt → 投批 → 等片 → 拉回 → 循环化 → 上墙
 assets/              # 成品素材(loop 版)
 manifests/           # 投批 JSONL 存档
+app/                 # dynwall — gpui-kit 动态壁纸更换器(画廊/生成/轮换, 见下)
 ```
+
+## dynwall — gpui-kit 壁纸更换器 app
+
+`app/` 是一个 Rust 桌面 app(`gpui-kit = "0.7"`,longbridge/gpui-kit 组件库):
+
+- **画廊**:扫 `~/Videos/wallpapers/` + 仓库 `assets/`(可用 `DYNWALL_SEED_DIR` 覆盖),
+  ffmpeg 抽封面帧(缓存于 `~/.cache/dynwall/thumbs/`),点选 → 上墙/预览/停
+- **生成**:一句话 prompt → SSH 投批 DGX 农场(`DYNWALL_DGX`,默认 `dgx_spark`,
+  与 gen-wallpaper 同一 inbox/out 链路)→ 轮询 → 拉回 → 本地 crossfade 循环化 →
+  自动入库刷新画廊(约 7-8 分钟)
+- **自动轮换**:开关 + 1/3/5/10/30 分钟间隔,到点切下一张并上墙
+- 上墙后端:Linux 走 `koi-wallpaper`(mpvpaper);macOS 预览用 mpv 循环/open 兜底
+
+```bash
+cd app && cargo run --release
+```
+
+> 生成链路复用农场 SSH 投批,不在 app 内存任何 API key;FL2VA 首尾同帧档
+> 仍走 `bin/gen-wallpaper --keyframe`(需要挑关键帧,脚本链路更顺手)。
 
 ## 现场演示节奏(约 10 分钟)
 

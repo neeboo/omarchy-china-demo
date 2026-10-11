@@ -1,0 +1,11 @@
+[package]
+name = "dynwall"
+version = "0.1.0"
+edition = "2021"
+description = "动态壁纸更换器 — CC0/自有素材画廊 + h3 现场生成 + 自动轮换 (gpui-kit)"
+
+[dependencies]
+gpui-kit = "0.7"
+anyhow = "1"
+smol = "2"
+dirs = "6"
