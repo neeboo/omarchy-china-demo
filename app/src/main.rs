@@ -21,11 +21,11 @@ use gpui_kit::component::{
     separator::Separator,
     switch::Switch,
     tab::{Tab, TabBar},
-    ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, Size, TitleBar, WindowExt as _,
-    v_flex,
+    ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, Size, Theme, TitleBar,
+    WindowExt as _, v_flex,
 };
 use gpui_kit::{
-    div, img, px, AppContext as _, Bounds, Context, Entity, InteractiveElement as _,
+    div, img, px, rgb, AppContext as _, Bounds, Context, Entity, Hsla, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, StyledImage as _, Window, WindowBounds,
 };
@@ -59,12 +59,109 @@ fn thumb_dir() -> PathBuf {
         .join("dynwall/thumbs")
 }
 
+// ---------- 极客风主题 (phosphor terminal) ----------
+
+const C_BG: u32 = 0x0B0E13;
+const C_SURFACE: u32 = 0x11151D;
+const C_SURFACE2: u32 = 0x171D27;
+const C_BORDER: u32 = 0x1E2530;
+const C_FG: u32 = 0xC6D0DB;
+const C_DIM: u32 = 0x5C6875;
+const C_ACCENT: u32 = 0x35E08C;
+const C_ACCENT_HI: u32 = 0x4BE89B;
+const C_ACCENT_LO: u32 = 0x2BC97A;
+const C_ON_ACCENT: u32 = 0x062015;
+const C_AMBER: u32 = 0xE0B055;
+const C_DANGER: u32 = 0xE86A6A;
+const C_CYAN: u32 = 0x5AC8E8;
+
+fn hx(c: u32) -> Hsla {
+    rgb(c).into()
+}
+
+/// 全局换肤: 所有 kit 组件(Button/Input/Select/Switch/Tab/通知)一起跟着变。
+fn hack_theme(cx: &mut gpui_kit::App) {
+    Theme::update(cx, |t| {
+        t.radius = px(2.);
+        t.radius_lg = px(3.);
+        t.font_family = "Menlo".into();
+        t.font_size = px(13.);
+        t.mono_font_family = "Menlo".into();
+        t.mono_font_size = px(12.);
+        t.shadow = false;
+        t.focus_ring = false;
+        let c = &mut t.colors;
+        c.background = hx(C_BG);
+        c.foreground = hx(C_FG);
+        c.border = hx(C_BORDER);
+        c.window_border = hx(C_BORDER);
+        c.title_bar = hx(C_BG);
+        c.title_bar_border = hx(C_BORDER);
+        c.status_bar = hx(C_SURFACE);
+        c.status_bar_border = hx(C_BORDER);
+        c.input = hx(C_BORDER);
+        c.caret = hx(C_ACCENT);
+        c.ring = hx(C_ACCENT_LO);
+        c.selection = hx(0x1B3A2B);
+        c.primary = hx(C_ACCENT);
+        c.primary_foreground = hx(C_ON_ACCENT);
+        c.primary_hover = hx(C_ACCENT_HI);
+        c.primary_active = hx(C_ACCENT_LO);
+        c.button_primary = hx(C_ACCENT);
+        c.button_primary_foreground = hx(C_ON_ACCENT);
+        c.button_primary_hover = hx(C_ACCENT_HI);
+        c.button_primary_active = hx(C_ACCENT_LO);
+        c.button = hx(C_SURFACE);
+        c.button_foreground = hx(C_FG);
+        c.button_hover = hx(C_SURFACE2);
+        c.button_active = hx(C_SURFACE2);
+        c.secondary = hx(C_SURFACE);
+        c.secondary_foreground = hx(C_FG);
+        c.secondary_hover = hx(C_SURFACE2);
+        c.secondary_active = hx(C_SURFACE2);
+        c.button_secondary = hx(C_SURFACE);
+        c.button_secondary_foreground = hx(C_FG);
+        c.button_secondary_hover = hx(C_SURFACE2);
+        c.button_secondary_active = hx(C_SURFACE2);
+        c.danger = hx(C_DANGER);
+        c.danger_foreground = hx(C_DANGER);
+        c.button_danger = hx(0x241419);
+        c.button_danger_foreground = hx(C_DANGER);
+        c.button_danger_hover = hx(0x33191E);
+        c.button_danger_active = hx(0x3D1E24);
+        c.accent = hx(C_ACCENT);
+        c.accent_foreground = hx(C_ON_ACCENT);
+        c.muted = hx(C_SURFACE);
+        c.muted_foreground = hx(C_DIM);
+        c.popover = hx(0x10141C);
+        c.popover_foreground = hx(C_FG);
+        c.list = hx(C_SURFACE);
+        c.list_hover = hx(C_SURFACE2);
+        c.list_active = hx(C_SURFACE2);
+        c.list_active_border = hx(C_ACCENT);
+        c.link = hx(C_CYAN);
+        c.link_hover = hx(C_CYAN);
+        c.switch = hx(C_ACCENT);
+        c.progress_bar = hx(C_ACCENT);
+        c.scrollbar = hx(C_SURFACE);
+        c.scrollbar_thumb = hx(0x2A3340);
+        c.scrollbar_thumb_hover = hx(0x39424E);
+        c.overlay = hx(0x000000);
+        c.tab_bar = hx(C_BG);
+        c.tab_bar_segmented = hx(C_SURFACE);
+        c.tab_active = hx(C_SURFACE2);
+        c.tab_active_foreground = hx(C_ACCENT);
+        c.tab_foreground = hx(C_DIM);
+    });
+}
+
 // ---------- 素材库 ----------
 
 struct WallEntry {
     path: PathBuf,
     name: String,
     thumb: Option<PathBuf>,
+    meta: Option<String>,
 }
 
 impl WallEntry {
@@ -96,7 +193,7 @@ impl WallEntry {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let thumb = thumb_for(&p);
-                out.push(Self { path: p, name, thumb });
+                out.push(Self { path: p, name, thumb, meta: None });
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -125,6 +222,31 @@ fn make_thumb(video: &Path, out: &Path) -> anyhow::Result<()> {
         anyhow::bail!("ffmpeg thumbnail failed for {}", video.display());
     }
     Ok(())
+}
+
+/// 卡片元数据行: 1920×1080 · 10.0s · 2.4M。阻塞, 请放后台。
+fn probe_meta(video: &Path) -> Option<String> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-show_entries", "format=duration,size",
+            "-of", "csv=p=0",
+            video.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut lines = s.lines().filter(|l| !l.trim().is_empty());
+    let wh = lines.next()?;
+    let ds = lines.next()?;
+    let mut wh = wh.split(',');
+    let w = wh.next()?.trim();
+    let h = wh.next()?.trim();
+    let mut ds = ds.split(',');
+    let dur: f64 = ds.next()?.trim().parse().ok()?;
+    let size: f64 = ds.next()?.trim().parse().ok()?;
+    Some(format!("{w}×{h} · {dur:.1}s · {:.1}M", size / 1048576.))
 }
 
 // ---------- 应用上墙 / 预览 ----------
@@ -284,6 +406,7 @@ struct DynWall {
     tab_ix: usize,
     entries: Vec<WallEntry>,
     selected: usize,
+    applied: Option<String>,
     prompt: Entity<InputState>,
     dur_select: Entity<SelectState<Vec<&'static str>>>,
     ratio_select: Entity<SelectState<Vec<SharedString>>>,
@@ -318,6 +441,7 @@ impl DynWall {
             tab_ix: 0,
             entries,
             selected: 0,
+            applied: None,
             prompt,
             dur_select,
             ratio_select,
@@ -328,29 +452,46 @@ impl DynWall {
             rotate_tick: 0,
         };
 
-        // 封面帧后台补齐
+        // 封面帧 + 元数据后台补齐
         cx.spawn(async move |this, cx| {
-            let missing: Vec<(PathBuf, PathBuf)> = this.update(cx, |t, _| {
+            eprintln!("[backfill] start");
+            let todo: Vec<(PathBuf, PathBuf, bool)> = this.update(cx, |t, _| {
                 t.entries
                     .iter()
-                    .filter(|e| e.thumb.is_none())
-                    .map(|e| (e.path.clone(), thumb_for(&e.path).unwrap_or_else(|| {
-                        let mut h = DefaultHasher::new();
-                        e.path.hash(&mut h);
-                        thumb_dir().join(format!("{:016x}.png", h.finish()))
-                    })))
+                    .filter(|e| e.thumb.is_none() || e.meta.is_none())
+                    .map(|e| {
+                        let thumb = thumb_for(&e.path).unwrap_or_else(|| {
+                            let mut h = DefaultHasher::new();
+                            e.path.hash(&mut h);
+                            thumb_dir().join(format!("{:016x}.png", h.finish()))
+                        });
+                        (e.path.clone(), thumb, e.thumb.is_none())
+                    })
                     .collect()
             })?;
-            for (video, thumb) in missing {
-                if make_thumb(&video, &thumb).is_ok() {
-                    this.update(cx, |t, cx| {
-                        if let Some(e) = t.entries.iter_mut().find(|e| e.path == video) {
+            eprintln!("[backfill] todo={} entries", todo.len());
+            for (video, thumb, need_thumb) in todo {
+                if need_thumb && make_thumb(&video, &thumb).is_err() {
+                    continue;
+                }
+                eprintln!("[backfill] probing {}", video.display());
+                let meta = smol::unblock({
+                    let v = video.clone();
+                    move || probe_meta(&v)
+                })
+                .await;
+                eprintln!("[backfill] probed -> {meta:?}");
+                this.update(cx, |t, cx| {
+                    if let Some(e) = t.entries.iter_mut().find(|e| e.path == video) {
+                        if e.thumb.is_none() {
                             e.thumb = Some(thumb.clone());
                         }
-                        cx.notify();
-                    })?;
-                }
+                        e.meta = meta;
+                    }
+                    cx.notify();
+                })?;
             }
+            eprintln!("[backfill] done");
             anyhow::Ok(())
         })
         .detach();
@@ -384,7 +525,9 @@ impl DynWall {
                     this.update(cx, |t, cx| {
                         t.selected = (t.selected + 1) % t.entries.len().max(1);
                         if let Some(e) = t.entries.get(t.selected) {
-                            let _ = apply_wallpaper(&e.path);
+                            if apply_wallpaper(&e.path).is_ok() {
+                                t.applied = Some(e.name.clone());
+                            }
                         }
                         cx.notify();
                     })
@@ -609,22 +752,68 @@ impl Render for DynWall {
                 this.tab_ix = *ix;
                 cx.notify();
             }))
-            .child(Tab::new().label("画廊"))
-            .child(Tab::new().label("生成"));
+            .child(Tab::new().label("01 画廊"))
+            .child(Tab::new().label("02 生成"));
 
         let body = match self.tab_ix {
             0 => self.render_gallery(window, cx).into_any_element(),
             _ => self.render_generate(cx).into_any_element(),
         };
 
+        // TUI 状态栏
+        let (led, led_text, led_color) = match &self.applied {
+            Some(n) => ("●", format!("ON WALL ▸ {n}"), hx(C_ACCENT)),
+            None => ("○", "IDLE".into(), hx(C_DIM)),
+        };
+        let rotate_txt = if self.rotate {
+            let m = self
+                .rotate_min
+                .read(cx)
+                .selected_value()
+                .copied()
+                .unwrap_or("5");
+            format!("ROTATE {m}MIN")
+        } else {
+            "ROTATE OFF".into()
+        };
+        let status_bar = h_flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .bg(hx(C_SURFACE))
+            .border_t_1()
+            .border_color(hx(C_BORDER))
+            .text_size(px(11.))
+            .child(div().text_color(led_color).child(led))
+            .child(div().text_color(led_color).child(led_text))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_color(hx(C_DIM))
+                    .child(format!(
+                        "{} ASSETS · DGX {} · {} · DYNWALL v0.1",
+                        self.entries.len(),
+                        dgx_host(),
+                        rotate_txt
+                    )),
+            );
+
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child(TitleBar::new().child("动态壁纸 · DynWall").child(tab_bar))
+            .font_family("Menlo")
+            .bg(hx(C_BG))
+            .text_color(hx(C_FG))
+            .child(
+                TitleBar::new()
+                    .child("DYNWALL")
+                    .child(Label::new("· 动态壁纸更换器").text_size(px(12.)).text_color(hx(C_DIM)))
+                    .child(tab_bar),
+            )
             .child(div().flex_1().min_h_0().child(body))
+            .child(status_bar)
     }
 }
 
@@ -639,24 +828,29 @@ impl DynWall {
             .flex_wrap()
             .gap_3()
             .p_4()
+            .content_start()
             .overflow_y_scroll();
         if self.entries.is_empty() {
             grid = grid.child(
-                Label::new("素材库为空 — 把 loop mp4 放进 ~/Videos/wallpapers/ 或点「生成」")
-                    .text_color(theme.muted_foreground),
+                Label::new("// 素材库为空 — 把 loop mp4 丢进 ~/Videos/wallpapers/ 或切「02 生成」")
+                    .text_size(px(12.))
+                    .text_color(hx(C_DIM)),
             );
         }
         for (ix, e) in self.entries.iter().enumerate() {
             let selected = ix == self.selected;
+            let on_wall = self.applied.as_deref() == Some(e.name.as_str());
             let mut card = div()
                 .id(ix)
                 .w(px(240.))
                 .flex()
                 .flex_col()
                 .rounded(theme.radius_lg)
+                .bg(if selected { hx(C_SURFACE2) } else { hx(C_SURFACE) })
                 .border_1()
                 .cursor_pointer()
                 .overflow_hidden()
+                .hover(|s| s.border_color(hx(C_ACCENT_LO)))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.selected = ix;
                     cx.notify();
@@ -665,9 +859,9 @@ impl DynWall {
                     }
                 }));
             card = if selected {
-                card.border_color(theme.primary).border_2()
+                card.border_color(hx(C_ACCENT))
             } else {
-                card.border_color(theme.border)
+                card.border_color(hx(C_BORDER))
             };
             let poster: Box<dyn Fn() -> gpui_kit::AnyElement> = match &e.thumb {
                 Some(t) => {
@@ -676,14 +870,33 @@ impl DynWall {
                 }
                 None => Box::new(|| div().w_full().h(px(135.)).into_any_element()),
             };
-            card = card.child(poster()).child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_sm()
-                    .text_ellipsis()
-                    .child(e.name.clone()),
-            );
+            let name_color = if selected { hx(C_ACCENT) } else { hx(C_FG) };
+            let marker: &str = if on_wall {
+                " ▸W"
+            } else if selected {
+                " ▸"
+            } else {
+                ""
+            };
+            card = card
+                .child(poster())
+                .child(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .text_size(px(12.))
+                        .text_ellipsis()
+                        .child(format!("{:02} {}{}", ix + 1, e.name, marker))
+                        .text_color(name_color),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .text_size(px(10.5))
+                        .text_color(hx(C_DIM))
+                        .child(e.meta.clone().unwrap_or_else(|| "probing…".into())),
+                );
             grid = grid.child(card);
         }
 
@@ -698,17 +911,28 @@ impl DynWall {
             .gap_2()
             .px_4()
             .py_2()
+            .bg(hx(C_SURFACE))
             .border_b_1()
             .border_color(theme.border)
-            .child(Label::new(format!("当前: {selected_name}")).text_sm().flex_1())
+            .text_size(px(12.))
+            .child(
+                Label::new(format!("TARGET ▸ {selected_name}"))
+                    .text_size(px(12.))
+                    .text_color(hx(C_ACCENT))
+                    .flex_1(),
+            )
             .child(
                 Button::new("apply")
                     .primary()
                     .label("上墙")
+                    .with_size(Size::Small)
                     .on_click(cx.listener(|this, _, window, cx| {
                         match this.entries.get(this.selected) {
                             Some(e) => match apply_wallpaper(&e.path) {
-                                Ok(()) => window.push_notification(format!("已上墙 {}", e.name), cx),
+                                Ok(()) => {
+                                    this.applied = Some(e.name.clone());
+                                    window.push_notification(format!("已上墙 {}", e.name), cx);
+                                }
                                 Err(er) => window.push_notification(format!("上墙失败: {er}"), cx),
                             },
                             None => window.push_notification("先选一张素材", cx),
@@ -718,6 +942,7 @@ impl DynWall {
             .child(
                 Button::new("preview")
                     .label("预览")
+                    .with_size(Size::Small)
                     .on_click(cx.listener(|this, _, _, _| {
                         if let Some(e) = this.entries.get(this.selected) {
                             let _ = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
@@ -730,13 +955,15 @@ impl DynWall {
                 Button::new("stop")
                     .danger()
                     .label("停")
-                    .on_click(cx.listener(|_, _, window, cx| {
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
                         stop_wallpaper();
+                        this.applied = None;
                         window.push_notification("已停, 恢复静态壁纸", cx);
                     })),
             )
             .child(Separator::horizontal())
-            .child(Label::new("轮换").text_sm())
+            .child(Label::new("轮换").text_size(px(12.)).text_color(hx(C_DIM)))
             .child(
                 Switch::new("rotate")
                     .checked(self.rotate)
@@ -746,7 +973,7 @@ impl DynWall {
                         cx.notify();
                     })),
             )
-            .child(Select::new(&self.rotate_min).w(px(96.)).with_size(Size::Small));
+            .child(Select::new(&self.rotate_min).w(px(88.)).with_size(Size::Small));
 
         v_flex().size_full()
             .child(toolbar)
@@ -755,28 +982,42 @@ impl DynWall {
 
     fn render_generate(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let busy = self.gen.as_ref().is_some_and(|g| g.phase.busy());
         let status = self.gen.as_ref().map(|g| {
             let el = self.elapsed_text();
-            let time = if el.is_empty() { String::new() } else { format!(" ({el})") };
-            format!("{}{time}", g.phase.text())
+            let time = if el.is_empty() { String::new() } else { format!(" · {el}") };
+            let color = match &g.phase {
+                GenPhase::Done(_) => hx(C_ACCENT),
+                GenPhase::Failed(_) => hx(C_DANGER),
+                _ => hx(C_AMBER),
+            };
+            (
+                color,
+                format!("{}{} ▌", g.phase.text(), time),
+            )
         });
 
         v_flex()
             .p_4()
-            .gap_3()
-            .max_w(px(640.))
-            .child(Label::new("一句话描述想要的壁纸 (T2VA 直出 + 本地 crossfade 无缝循环)").text_sm().text_color(theme.muted_foreground))
+            .gap_2()
+            .max_w(px(680.))
+            .child(
+                Label::new("PROMPT ▸ 一句话描述想要的壁纸 (T2VA 直出 + 本地 crossfade 无缝循环)")
+                    .text_size(px(12.))
+                    .text_color(hx(C_DIM)),
+            )
             .child(Input::new(&self.prompt))
             .child(
-                h_flex().items_center().gap_3()
-                    .child(Label::new("时长").text_sm())
-                    .child(Select::new(&self.dur_select).w(px(96.)))
-                    .child(Label::new("比例").text_sm())
-                    .child(Select::new(&self.ratio_select).w(px(112.)))
+                h_flex().items_center().gap_3().mt_1()
+                    .child(Label::new("PARAMS ▸").text_size(px(12.)).text_color(hx(C_DIM)))
+                    .child(Label::new("时长").text_size(px(12.)).text_color(hx(C_DIM)))
+                    .child(Select::new(&self.dur_select).w(px(88.)).with_size(Size::Small))
+                    .child(Label::new("比例").text_size(px(12.)).text_color(hx(C_DIM)))
+                    .child(Select::new(&self.ratio_select).w(px(104.)).with_size(Size::Small))
                     .child(
                         Switch::new("seamless")
                             .checked(self.seamless)
-                            .label("落库自动 crossfade 循环化")
+                            .label("自动 crossfade 循环化")
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                 this.seamless = *checked;
                                 cx.notify();
@@ -786,19 +1027,28 @@ impl DynWall {
             .child(
                 Button::new("gen")
                     .primary()
-                    .label(if self.gen.as_ref().is_some_and(|g| g.phase.busy()) { "投批中/渲染中…" } else { "生成 (约 7-8 分钟)" })
-                    .disabled(self.gen.as_ref().is_some_and(|g| g.phase.busy()))
+                    .label(if busy { "RENDERING ▸▸▸" } else { "▸ RENDER · h3-fast-12 @0.7MP · ~7MIN" })
+                    .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.submit_generation(cx);
                     })),
             )
-            .children(status.map(|s| Label::new(s).text_sm()))
+            .children(status.map(|(color, s)| {
+                Label::new(format!("$ {s}")).text_size(px(12.)).text_color(color)
+            }))
+            .child(
+                Label::new("// SSH 投批 → DGX inbox → 轮询 out/ → scp 拉回 → crossfade → 自动入库")
+                    .text_size(px(10.5))
+                    .text_color(hx(C_DIM)),
+            )
+            .text_color(theme.foreground)
     }
 }
 
 fn main() {
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
+        hack_theme(cx);
         let mut options = TitleBar::window_options();
         options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
             None,
