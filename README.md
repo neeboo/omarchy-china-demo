@@ -19,22 +19,24 @@ app/                 # dynwall — gpui-kit 动态壁纸更换器(画廊/生成/
 
 - **画廊**:扫 `~/Videos/wallpapers/` + 仓库 `assets/`(可用 `DYNWALL_SEED_DIR` 覆盖),
   ffmpeg 抽封面帧(缓存于 `~/.cache/dynwall/thumbs/`),点选 → 上墙/预览/停
-- **生成**:一句话 prompt → SSH 投批 holycrab 农场(与 gen-wallpaper 同一 inbox/out
-  链路)→ 轮询 → 拉回 → 本地 crossfade 循环化 → 自动入库刷新画廊(约 7-8 分钟)
-- **连接**:farm 的 SSH 凭据直接在 app 里配 — host/user/port + 粘贴私钥 → 保存 →
-  测连。存 `~/.config/dynwall/holycrab.conf` + `id_holycrab`(0600),凭据不进仓库;
-  新机器(如 VM)开箱贴一次 key 即可,不用再拷 `~/.ssh`。未配置时回退 `~/.ssh`
-  alias(`DYNWALL_FARM`,默认 `holycrab`;旧 `DYNWALL_DGX` 仍兼容)
+- **生成**:一句话 prompt → h3 batch 投批(`POST /batch`,单行 JSONL,`raw:true`
+  免片尾卡,自动入库刷新画廊。成品名可预判,app 轮询 `GET /outfile?name=` 直到
+  就绪再经同一接口取件——全程走 API 域名代理,**现场任意网络可达**
+  (h3-fast-12 @0.7MP/5s 约 3-5 分钟,队列忙时顺延)。关掉「自动 crossfade
+  循环化」开关则原片直入库
+- **连接**:h3 API 凭据直接在 app 里配 — URL + 粘贴 API key → 保存 → 测连。
+  存 `~/.config/dynwall/h3-api.conf`(0600),key 不进仓库;投批/取件都要
+  含 `batch` scope 的 key。任何网络可达即可用,不要求与农场同内网
 - **自动轮换**:开关 + 1/3/5/10/30 分钟间隔,到点切下一张并上墙
 - 上墙后端:Linux 走 `koi-wallpaper`(mpvpaper),缺了自动退 mpvpaper → mpv;
-  macOS 预览用 mpv 循环/open 兜底
+  虚机(VirGL)自动软件 GL + X11 输出绕开 `EGL_BAD_MATCH`;macOS 用 mpv 循环/open
 
 ```bash
 cd app && cargo run --release
 ```
 
-> 生成链路复用农场 SSH 投批,不在 app 内存任何 API key;FL2VA 首尾同帧档
-> 仍走 `bin/gen-wallpaper --keyframe`(需要挑关键帧,脚本链路更顺手)。
+> FL2VA 首尾同帧档仍走 `bin/gen-wallpaper --keyframe`(需要挑关键帧,脚本链路
+> 更顺手);app 生成页为 T2VA + 本地 crossfade 快速档。
 
 ## 现场演示节奏(约 10 分钟)
 
@@ -74,7 +76,7 @@ git pull
 - 虚机里自动启用软件 GL(`LIBGL_ALWAYS_SOFTWARE`)——VirGL 的 EGL 配置匹配
   不上(`EGL_BAD_MATCH`),软件渲染绕过;koi-wallpaper 与 app 均内置该自适应
 
-「03 连接」页贴一次 farm 私钥即可,不用拷 `~/.ssh`。
+「03 连接」页贴一次 h3 API key 即可(投批+取件全走公网 API,不需 SSH)。
 
 Mac 端预览:Plash(brew install plash)→ 指向 loop mp4 的 file:// URL。
 
@@ -82,4 +84,5 @@ Mac 端预览:Plash(brew install plash)→ 指向 loop mp4 的 file:// URL。
 
 - Try Omarchy VM 无硬解(CPU 软解 736p 无压力),VirGL 仅 OpenGL;裸金属最顺
 - 1.0MP 档强制 5min 间隔 + 白天热学受限;demo 用 0.7MP 档全天安全
-- h3 成品默认进 COS;本 demo 走 farm 内网 inbox 投递,out/ 直取,不经公网
+- app 生成走公网 h3 batch API(任意网络可用,经 `/api/h3/outfile` 代理取件);
+  `bin/gen-wallpaper` 脚本链路仍走内网 inbox 直投(与农场同网时更快,不经公网)

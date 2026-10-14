@@ -1,17 +1,19 @@
 // dynwall — 动态壁纸更换器 (gpui-kit)
 //
-// 画廊(CC0/自有 loop 素材) + 生成页(prompt → holycrab h3 农场 → 下载 → 本地 crossfade
+// 画廊(CC0/自有 loop 素材) + 生成页(prompt → h3 API → 轮询 → 下载 → 本地 crossfade
 // 循环化) + 自动轮换。渲染后端: Linux 走 mpvpaper/koi-wallpaper, macOS 用 mpv/open 预览。
 //
 // 素材库目录: ~/Videos/wallpapers + $DYNWALL_SEED_DIR (默认本仓库 assets/)。
-// 生成走 SSH 投批, 复用 gen-wallpaper 的 inbox/out 链路。连接凭据在「03 连接」页
-// 管理 (~/.config/dynwall/holycrab.conf + id_holycrab), 未配置时回退 ~/.ssh alias
-// (DYNWALL_FARM, 默认 holycrab; 旧 DYNWALL_DGX 仍兼容)。
+// 生成走 h3 batch 链: POST /api/h3/batch 投单行 JSONL (raw=true 免片尾卡) →
+// 轮询 GET /api/h3/outfile?name= (成品名可预判: {project}_{id}_s{steps}_seed{seed}.mp4;
+// 404=渲染中, 200=就绪) → 同 URL 下载。全程 API 域名代理, 现场任意网络可达。
+// API 凭据在「03 连接」页管理 (~/.config/dynwall/h3-api.conf, 0600), key 不进仓库;
+// 投批/取件都需要含 batch scope 的 key。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::h_flex;
@@ -33,8 +35,6 @@ use gpui_kit::{
 };
 use smol::Timer;
 
-const FARM_DIR: &str = "/home/spark/h3_factory";
-const PROJECT: &str = "omarchy-demo";
 const POLL_SECS: u64 = 30;
 const GEN_TIMEOUT_SECS: u64 = 1500;
 
@@ -44,12 +44,8 @@ const UI_FONT: &str = "Menlo";
 #[cfg(not(target_os = "macos"))]
 const UI_FONT: &str = "Noto Sans Mono CJK SC";
 
-/// 未在「03 连接」配置时的回退 ssh alias (旧 env DYNWALL_DGX 仍兼容)。
-fn legacy_host() -> String {
-    std::env::var("DYNWALL_FARM")
-        .or_else(|_| std::env::var("DYNWALL_DGX"))
-        .unwrap_or_else(|_| "holycrab".into())
-}
+/// h3 API 默认入口 (可在「03 连接」改)。
+const API_DEFAULT_URL: &str = "https://h3.holycrab.ai";
 
 fn seed_dir() -> Option<PathBuf> {
     match std::env::var("DYNWALL_SEED_DIR") {
@@ -70,7 +66,7 @@ fn thumb_dir() -> PathBuf {
         .join("dynwall/thumbs")
 }
 
-// ---------- holycrab 连接配置 (UI 管理, 凭据不进仓库) ----------
+// ---------- h3 API 连接配置 (UI 管理, key 不进仓库) ----------
 
 fn app_config_dir() -> PathBuf {
     dirs::config_dir()
@@ -78,109 +74,54 @@ fn app_config_dir() -> PathBuf {
         .join("dynwall")
 }
 
-/// holycrab.conf 三行: host= user= port=
-fn parse_holycrab_conf() -> Option<(String, String, u16)> {
-    let s = std::fs::read_to_string(app_config_dir().join("holycrab.conf")).ok()?;
-    let (mut host, mut user, mut port) = (String::new(), String::new(), 22u16);
+/// h3-api.conf 两行: url= key=
+fn parse_api_conf() -> Option<(String, String)> {
+    let s = std::fs::read_to_string(app_config_dir().join("h3-api.conf")).ok()?;
+    let (mut url, mut key) = (String::new(), String::new());
     for line in s.lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
         match k.trim() {
-            "host" => host = v.trim().into(),
-            "user" => user = v.trim().into(),
-            "port" => port = v.trim().parse().unwrap_or(22),
+            "url" => url = v.trim().trim_end_matches('/').into(),
+            "key" => key = v.trim().into(),
             _ => {}
         }
     }
-    (!host.is_empty() && !user.is_empty()).then_some((host, user, port))
+    (!url.is_empty() && !key.is_empty()).then_some((url, key))
 }
 
-/// 解析后的 SSH 连接: 「03 连接」的显式配置优先, 否则回退 ~/.ssh alias。
+/// 解析后的 API 目标; 未在「03 连接」配置 = None (生成前必须先配 key)。
 #[derive(Clone)]
-struct SshTarget {
-    dest: String,
-    explicit: bool,
-    key: Option<PathBuf>,
-    port: u16,
-    known_hosts: Option<PathBuf>,
+struct ApiTarget {
+    base: String,
+    key: String,
 }
 
-impl SshTarget {
-    fn ssh_args(&self) -> Vec<String> {
-        let mut a: Vec<String> = vec!["-o".into(), "ConnectTimeout=10".into()];
-        if let Some(k) = &self.key {
-            a.extend(["-i".into(), k.to_string_lossy().into_owned()]);
-        }
-        if self.explicit {
-            a.extend(["-p".into(), self.port.to_string()]);
-            if let Some(kh) = &self.known_hosts {
-                a.extend([
-                    "-o".into(),
-                    format!("UserKnownHostsFile={}", kh.display()),
-                    "-o".into(),
-                    "StrictHostKeyChecking=accept-new".into(),
-                ]);
-            }
-        }
-        a.push(self.dest.clone());
-        a
-    }
-    fn scp_args(&self) -> Vec<String> {
-        let mut a: Vec<String> = vec!["-q".into()];
-        if let Some(k) = &self.key {
-            a.extend(["-i".into(), k.to_string_lossy().into_owned()]);
-        }
-        if self.explicit {
-            a.extend(["-P".into(), self.port.to_string()]);
-            if let Some(kh) = &self.known_hosts {
-                a.extend([
-                    "-o".into(),
-                    format!("UserKnownHostsFile={}", kh.display()),
-                    "-o".into(),
-                    "StrictHostKeyChecking=accept-new".into(),
-                ]);
-            }
-        }
-        a
-    }
-    /// 「03 连接」页的长状态。
-    fn mode_label(&self) -> String {
-        match (&self.explicit, &self.key) {
-            (true, Some(k)) => {
-                format!("EXPLICIT {}:{} · key ✓ {}", self.dest, self.port, k.display())
-            }
-            (true, None) => format!("EXPLICIT {}:{} · 无 key, 走本机默认私钥", self.dest, self.port),
-            (false, _) => format!("LEGACY ~/.ssh alias {} (未在 UI 配置)", self.dest),
-        }
-    }
+impl ApiTarget {
     /// 状态栏短状态。
     fn short_label(&self) -> String {
-        match self.key {
-            Some(_) => format!("{} 🔑", self.dest),
-            None => self.dest.clone(),
+        let host = self
+            .base
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        format!("{host} 🔑")
+    }
+    /// key 指纹: 前4…后4, 全值永不上屏。
+    fn key_label(&self) -> String {
+        let n = self.key.chars().count();
+        if n > 10 {
+            let head: String = self.key.chars().take(4).collect();
+            let tail: String = self.key.chars().skip(n - 4).collect();
+            format!("{head}…{tail}")
+        } else {
+            "•••".into()
         }
     }
 }
 
-fn load_conn() -> SshTarget {
-    if let Some((host, user, port)) = parse_holycrab_conf() {
-        let key = app_config_dir().join("id_holycrab");
-        return SshTarget {
-            dest: format!("{user}@{host}"),
-            explicit: true,
-            key: key.is_file().then_some(key),
-            port,
-            known_hosts: Some(app_config_dir().join("known_hosts")),
-        };
-    }
-    SshTarget {
-        dest: legacy_host(),
-        explicit: false,
-        key: None,
-        port: 22,
-        known_hosts: None,
-    }
+fn load_api() -> Option<ApiTarget> {
+    parse_api_conf().map(|(base, key)| ApiTarget { base, key })
 }
 
 // ---------- 极客风主题 (phosphor terminal) ----------
@@ -454,45 +395,68 @@ fn stop_wallpaper() {
     }
 }
 
-// ---------- SSH 投批链路 (与 gen-wallpaper 同路) ----------
+// ---------- h3 API (走系统 curl, app 不引 HTTP 依赖) ----------
 
-fn ssh_run(t: &SshTarget, cmd: &str) -> anyhow::Result<String> {
-    let out = Command::new("ssh").args(t.ssh_args()).arg(cmd).output()?;
-    if !out.status.success() {
-        anyhow::bail!("ssh {}: {}", t.dest, String::from_utf8_lossy(&out.stderr).trim());
+/// 一次 curl 请求, 返回 (body, http_code)。鉴权双头: X-API-Key + Bearer
+/// (outfile 等 older 端点只认 Authorization, 不读 X-API-Key)。
+fn curl_req(t: &ApiTarget, method: &str, url: &str, extra: &[String]) -> anyhow::Result<(String, String)> {
+    let out = Command::new("curl")
+        .args(["-sS", "--max-time", "30", "-w", "\n%{http_code}"])
+        .arg("-X").arg(method)
+        .arg("-H").arg(format!("X-API-Key: {}", t.key))
+        .arg("-H").arg(format!("Authorization: Bearer {}", t.key))
+        .args(extra)
+        .arg(url)
+        .output()?;
+    if out.stdout.is_empty() {
+        anyhow::bail!("curl {}: {}", String::from_utf8_lossy(&out.stderr).trim(), "无响应");
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    match s.rfind('\n') {
+        Some(i) => Ok((s[..i].to_owned(), s[i + 1..].trim().to_owned())),
+        None => Ok((s, "0".into())),
+    }
 }
 
-fn ssh_write_manifest(t: &SshTarget, remote: &str, content: &str) -> anyhow::Result<()> {
-    use std::io::Write as _;
-    let mut child = Command::new("ssh")
-        .args(t.ssh_args())
-        .arg(format!("cat > {remote}"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("ssh stdin closed"))?
-        .write_all(content.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        anyhow::bail!("manifest submit: {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(())
+/// 从服务端响应里抠字段 ("k":"v" 字符串) — 响应结构已知, 够用; 不引 serde。
+fn json_field(s: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":");
+    let i = s.find(&pat)? + pat.len();
+    let rest = s[i..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].replace("\\\"", "\"").replace("\\\\", "\\"))
 }
 
-fn scp_pull(t: &SshTarget, remote: &str, local: &Path) -> anyhow::Result<()> {
-    let out = Command::new("scp")
-        .args(t.scp_args())
-        .arg(format!("{}:{remote}", t.dest))
-        .arg(local.to_string_lossy().as_ref())
+/// 只探 http 状态码 (轮询 outfile 用) — 404=还没好, 200=成品就绪。
+fn curl_code(t: &ApiTarget, url: &str) -> anyhow::Result<u16> {
+    let out = Command::new("curl")
+        .args(["-sS", "--max-time", "30", "-o", "/dev/null", "-w", "%{http_code}"])
+        .arg("-H").arg(format!("X-API-Key: {}", t.key))
+        .arg("-H").arg(format!("Authorization: Bearer {}", t.key))
+        .arg(url)
         .output()?;
     if !out.status.success() {
-        anyhow::bail!("scp pull: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!("curl: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    s.parse::<u16>().map_err(|_| anyhow::anyhow!("异常回包: {s}"))
+}
+
+fn curl_download(t: &ApiTarget, url: &str, to: &Path) -> anyhow::Result<()> {
+    let st = Command::new("curl")
+        .args(["-sS", "-L", "--max-time", "600", "-o"])
+        .arg(to)
+        .arg("-H").arg(format!("X-API-Key: {}", t.key))
+        .arg("-H").arg(format!("Authorization: Bearer {}", t.key))
+        .arg(url)
+        .status()?;
+    if !st.success() {
+        anyhow::bail!("下载失败 (curl exit {st})");
+    }
+    let sz = std::fs::metadata(to).map(|m| m.len()).unwrap_or(0);
+    if sz < 4096 {
+        anyhow::bail!("下载产物过小 ({sz}B), 大概率取件失败");
     }
     Ok(())
 }
@@ -581,11 +545,9 @@ struct DynWall {
     rotate: bool,
     rotate_min: Entity<SelectState<Vec<&'static str>>>,
     rotate_tick: u64,
-    cfg_host: Entity<InputState>,
-    cfg_user: Entity<InputState>,
-    cfg_port: Entity<InputState>,
+    cfg_url: Entity<InputState>,
     cfg_key: Entity<TextareaState>,
-    conn_status: Option<(bool, String)>,
+    api_status: Option<(bool, String)>,
 }
 
 impl DynWall {
@@ -609,17 +571,12 @@ impl DynWall {
             SelectState::new(vec!["1", "3", "5", "10", "30"], Some(IndexPath::new(2)), window, cx)
         });
         // 「03 连接」预填: 已保存配置 > demo 默认值
-        let (ch, cu, cp) = parse_holycrab_conf()
-            .unwrap_or_else(|| ("192.168.1.227".into(), "spark".into(), 22));
-        let cfg_host =
-            cx.new(|cx| InputState::new(window, cx).default_value(ch).placeholder("192.168.1.227"));
-        let cfg_user =
-            cx.new(|cx| InputState::new(window, cx).default_value(cu).placeholder("spark"));
-        let cfg_port =
-            cx.new(|cx| InputState::new(window, cx).default_value(cp.to_string()).placeholder("22"));
+        let (url0, _key0) = parse_api_conf().unwrap_or_else(|| (API_DEFAULT_URL.into(), String::new()));
+        let cfg_url =
+            cx.new(|cx| InputState::new(window, cx).default_value(url0).placeholder(API_DEFAULT_URL));
         let cfg_key = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("粘贴 OpenSSH 私钥 (-----BEGIN ... PRIVATE KEY----- 整段)。留空 = 沿用已保存的 key")
+                .placeholder("粘贴 h3 API key (整串)。留空 = 沿用已保存的 key")
         });
         let this = Self {
             tab_ix: 0,
@@ -634,11 +591,9 @@ impl DynWall {
             rotate: false,
             rotate_min,
             rotate_tick: 0,
-            cfg_host,
-            cfg_user,
-            cfg_port,
+            cfg_url,
             cfg_key,
-            conn_status: None,
+            api_status: None,
         };
 
         // 封面帧 + 元数据后台补齐
@@ -754,30 +709,46 @@ impl DynWall {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64 * 7919 + d.as_secs() % 100000)
             .unwrap_or(42);
-        let id = format!("app_{}_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() % 100000)
-            .unwrap_or(0), seed % 1000);
+        let id = format!(
+            "d{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() % 100000)
+                .unwrap_or(0)
+        );
+        // batch 链: 成品名可预判 {project}_{id}_s{steps}_seed{seed}.mp4,
+        // raw=true 免片尾卡/响度归一 (壁纸素材要可循环)。
+        let deliverable = format!("dynwall_{id}_s4_seed{seed}.mp4");
         let manifest = format!(
-            r#"{{"id": "{id}", "project": "{PROJECT}", "prompt": {}, "model": "h3-fast-12", "mp": 0.7, "dur": {dur}, "ratio": "{ratio}", "seed": {seed}, "raw": true, "sheet": false}}"#,
+            r#"{{"id": "{id}", "project": "dynwall", "prompt": {}, "model": "h3-fast-12", "mp": 0.7, "ratio": "{ratio}", "dur": {dur}, "steps": 4, "seed": {seed}, "raw": true}}"#,
             json_str(&prompt),
         );
         self.gen = Some(GenJob { id: id.clone(), phase: GenPhase::Submitting, started: Instant::now() });
         cx.notify();
 
-        let conn = load_conn();
+        let Some(api) = load_api() else {
+            if let Some(g) = self.gen.as_mut() {
+                g.phase = GenPhase::Failed("未配置 h3 API key — 先去「03 连接」保存".into());
+            }
+            cx.notify();
+            return;
+        };
+        let seamless = self.seamless;
         cx.spawn(async move |this, cx| {
-            // 1) 投批
-            let remote_manifest = format!("{FARM_DIR}/inbox/60_{id}.jsonl");
-            let conn0 = conn.clone();
-            let r = smol::unblock({
-                let id = id.clone();
-                move || ssh_write_manifest(&conn0, &remote_manifest, &manifest)
-                    .map(|_| id)
+            // 1) 提交 POST /api/h3/batch — JSONL 单行任务; 整单校验, 拒收回 body 说明
+            let mf = std::env::temp_dir().join(format!("dynwall_batch_{seed}.jsonl"));
+            let _ = std::fs::write(&mf, &manifest);
+            let submit = smol::unblock({
+                let api = api.clone();
+                let mf = mf.clone();
+                move || {
+                    curl_req(&api, "POST", &format!("{}/api/h3/batch", api.base),
+                             &["-F".into(), format!("file=@{}", mf.display())])
+                }
             })
             .await;
-            let id = match r {
-                Ok(id) => id,
+            let (body, code) = match submit {
+                Ok(x) => x,
                 Err(e) => {
                     this.update(cx, |t, cx| {
                         if let Some(g) = t.gen.as_mut() {
@@ -788,63 +759,59 @@ impl DynWall {
                     return anyhow::Ok(());
                 }
             };
+            if !body.contains("\"accepted\"") {
+                let msg = json_field(&body, "detail").unwrap_or_else(|| {
+                    let snippet: String = body.chars().take(160).collect();
+                    format!("HTTP {code}: {snippet}")
+                });
+                this.update(cx, |t, cx| {
+                    if let Some(g) = t.gen.as_mut() {
+                        g.phase = GenPhase::Failed(format!("投批被拒: {msg}"));
+                    }
+                    cx.notify();
+                })?;
+                return anyhow::Ok(());
+            }
             this.update(cx, |t, cx| {
                 if let Some(g) = t.gen.as_mut() {
+                    g.id = id.chars().take(14).collect();
                     g.phase = GenPhase::Rendering;
                 }
                 cx.notify();
             })?;
 
-            // 2) 轮询 out/
-            let mut product = String::new();
+            // 2) 轮询 GET /api/h3/outfile?name= — batch 队列无状态端点, 成品文件名
+            //    可预判; 404=还在渲染/排队, 200=就绪 (同 URL 再拉一次即取件)。
+            //    全程走 API 域名代理, 现场任意网络可达。
+            let dl_url = format!("{}/api/h3/outfile?name={deliverable}", api.base);
             let mut waited = 0u64;
             loop {
                 Timer::after(Duration::from_secs(POLL_SECS)).await;
                 waited += POLL_SECS;
-                let probe = smol::unblock({
-                    let id = id.clone();
-                    let conn = conn.clone();
-                    move || {
-                        ssh_run(&conn,
-                            &format!("ls {FARM_DIR}/out/ 2>/dev/null | grep -F '{PROJECT}_{id}_' | grep '\\.mp4$' | head -1"))
-                            .or_else(|_| {
-                                // 区分失败: worker 判退/失败记日志
-                                ssh_run(&conn,
-                                    &format!("grep -E 'REJECT|FAIL' {FARM_DIR}/worker.log | grep -F '{id}' | head -1"))
-                                    .map(|_| "__failed__".to_string())
-                            })
-                    }
+                match smol::unblock({
+                    let api = api.clone();
+                    let u = dl_url.clone();
+                    move || curl_code(&api, &u)
                 })
-                .await;
-                match probe {
-                    Ok(s) if s == "__failed__" => {
-                        this.update(cx, |t, cx| {
-                            if let Some(g) = t.gen.as_mut() {
-                                g.phase = GenPhase::Failed("农场判退/失败, 查 worker.log".into());
-                            }
-                            cx.notify();
-                        })?;
-                        return anyhow::Ok(());
-                    }
-                    Ok(s) if !s.trim().is_empty() => {
-                        product = s.trim().into();
-                        break;
-                    }
-                    _ => {
-                        if waited >= GEN_TIMEOUT_SECS {
-                            this.update(cx, |t, cx| {
-                                if let Some(g) = t.gen.as_mut() {
-                                    g.phase = GenPhase::Failed(format!("{waited}s 超时"));
-                                }
-                                cx.notify();
-                            })?;
-                            return anyhow::Ok(());
+                .await
+                {
+                    Ok(200) => break,
+                    _ => {} // 404/429/抖动, 下轮再试
+                }
+                if waited >= GEN_TIMEOUT_SECS {
+                    this.update(cx, |t, cx| {
+                        if let Some(g) = t.gen.as_mut() {
+                            g.phase = GenPhase::Failed(format!(
+                                "{waited}s 超时 — batch 队列可能积压, 稍后在画廊手动重试或换个种子"
+                            ));
                         }
-                    }
+                        cx.notify();
+                    })?;
+                    return anyhow::Ok(());
                 }
             }
 
-            // 3) 拉回
+            // 3) 取件下载 (outfile 流式代理)
             this.update(cx, |t, cx| {
                 if let Some(g) = t.gen.as_mut() {
                     g.phase = GenPhase::Downloading;
@@ -855,23 +822,23 @@ impl DynWall {
             let _ = std::fs::create_dir_all(&raw_dir);
             let raw = raw_dir.join(format!("raw_{id}.mp4"));
             if let Err(e) = smol::unblock({
-                let product = product.clone();
+                let api = api.clone();
+                let dl_url = dl_url.clone();
                 let raw = raw.clone();
-                let conn = conn.clone();
-                move || scp_pull(&conn, &format!("{FARM_DIR}/out/{product}"), &raw)
+                move || curl_download(&api, &dl_url, &raw)
             })
             .await
             {
                 this.update(cx, |t, cx| {
                     if let Some(g) = t.gen.as_mut() {
-                        g.phase = GenPhase::Failed(format!("拉回失败: {e}"));
+                        g.phase = GenPhase::Failed(format!("下载失败: {e}"));
                     }
                     cx.notify();
                 })?;
                 return anyhow::Ok(());
             }
 
-            // 4) 循环化 + 入库
+            // 4) 循环化 (seamless 开关: 关 = 原片直入库) + 入库
             this.update(cx, |t, cx| {
                 if let Some(g) = t.gen.as_mut() {
                     g.phase = GenPhase::Looping;
@@ -879,11 +846,20 @@ impl DynWall {
                 cx.notify();
             })?;
             std::fs::create_dir_all(library_dir())?;
-            let out = library_dir().join(format!("{id}_loop.mp4"));
+            let suffix = if seamless { "_loop" } else { "_raw" };
+            let out = library_dir().join(format!("{id}{suffix}.mp4"));
             let r = smol::unblock({
                 let raw = raw.clone();
                 let out = out.clone();
-                move || crossfade_loop(&raw, &out)
+                move || {
+                    if seamless {
+                        crossfade_loop(&raw, &out)
+                    } else {
+                        std::fs::copy(&raw, &out)
+                            .map(|_| ())
+                            .map_err(|e| anyhow::anyhow!("入库失败: {e}"))
+                    }
+                }
             })
             .await;
             this.update(cx, |t, cx| {
@@ -983,9 +959,11 @@ impl Render for DynWall {
                 div()
                     .text_color(hx(C_DIM))
                     .child(format!(
-                        "{} ASSETS · {} · {} · DYNWALL v0.2",
+                        "{} ASSETS · {} · {} · DYNWALL v0.3",
                         self.entries.len(),
-                        load_conn().short_label(),
+                        load_api()
+                            .map(|a| a.short_label())
+                            .unwrap_or_else(|| "API 未配".into()),
                         rotate_txt
                     )),
             );
@@ -1218,7 +1196,7 @@ impl DynWall {
             .child(
                 Button::new("gen")
                     .primary()
-                    .label(if busy { "RENDERING ▸▸▸" } else { "▸ RENDER · h3-fast-12 @0.7MP · ~7MIN" })
+                    .label(if busy { "RENDERING ▸▸▸" } else { "▸ RENDER · h3-fast-12 @0.7MP · ~4MIN" })
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.submit_generation(cx);
@@ -1228,7 +1206,7 @@ impl DynWall {
                 Label::new(format!("$ {s}")).text_size(px(12.)).text_color(color)
             }))
             .child(
-                Label::new("// 投批 → 农场 inbox → 轮询 out/ → 拉回 → crossfade → 自动入库 (连接在「03 连接」配)")
+                Label::new("// 提交 h3 API → 轮询 → 下载直链 → crossfade → 自动入库 (key 在「03 连接」配)")
                     .text_size(px(10.5))
                     .text_color(hx(C_DIM)),
             )
@@ -1237,13 +1215,16 @@ impl DynWall {
 
     fn render_conn(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let conn = load_conn();
+        let mode = match load_api() {
+            Some(a) => format!("{} · key {}", a.base, a.key_label()),
+            None => "未配置 — 生成前先在下面保存 key".into(),
+        };
         v_flex()
             .p_4()
             .gap_2()
             .max_w(px(680.))
             .child(
-                Label::new("HOLYCRAB SSH ▸ 生成投批用的连接凭据 (存本机 ~/.config/dynwall/, 不进仓库)")
+                Label::new("H3 API ▸ 生成走 batch 投批 (X-API-Key; 存本机 ~/.config/dynwall/, 不进仓库)")
                     .text_size(px(12.))
                     .text_color(hx(C_DIM)),
             )
@@ -1251,19 +1232,15 @@ impl DynWall {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(Label::new("HOST").text_size(px(12.)).text_color(hx(C_DIM)))
-                    .child(Input::new(&self.cfg_host).w(px(180.)))
-                    .child(Label::new("USER").text_size(px(12.)).text_color(hx(C_DIM)))
-                    .child(Input::new(&self.cfg_user).w(px(110.)))
-                    .child(Label::new("PORT").text_size(px(12.)).text_color(hx(C_DIM)))
-                    .child(Input::new(&self.cfg_port).w(px(72.))),
+                    .child(Label::new("URL").text_size(px(12.)).text_color(hx(C_DIM)))
+                    .child(Input::new(&self.cfg_url).w(px(260.))),
             )
             .child(
-                Label::new("PRIVATE KEY ▸ 贴入 OpenSSH 私钥; 留空则沿用已保存的 key")
+                Label::new("API KEY ▸ 贴入整串 key; 留空则沿用已保存的 key (scope 需含 batch)")
                     .text_size(px(12.))
                     .text_color(hx(C_DIM)),
             )
-            .child(Textarea::new(&self.cfg_key).h(px(190.)))
+            .child(Textarea::new(&self.cfg_key).h(px(120.)))
             .child(
                 h_flex()
                     .items_center()
@@ -1296,18 +1273,18 @@ impl DynWall {
                     )
                     .child(div().flex_1())
                     .child(
-                        Label::new(format!("MODE ▸ {}", conn.mode_label()))
+                        Label::new(format!("MODE ▸ {mode}"))
                             .text_size(px(10.5))
                             .text_color(hx(C_AMBER)),
                     ),
             )
-            .children(self.conn_status.clone().map(|(ok, s)| {
+            .children(self.api_status.clone().map(|(ok, s)| {
                 Label::new(format!("$ {s}"))
                     .text_size(px(12.))
                     .text_color(if ok { hx(C_ACCENT) } else { hx(C_DANGER) })
             }))
             .child(
-                Label::new("// 保存后「02 生成」即走此凭据; VM/新机器无需再拷 ~/.ssh")
+                Label::new("// 保存后「02 生成」即走此 key (投批/轮询/取件全走公网 API); key 只存本机 0600")
                     .text_size(px(10.5))
                     .text_color(hx(C_DIM)),
             )
@@ -1315,57 +1292,73 @@ impl DynWall {
     }
 
     fn save_conn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let host = self.cfg_host.read(cx).value().trim().to_string();
-        let user = self.cfg_user.read(cx).value().trim().to_string();
-        let port: u16 = self.cfg_port.read(cx).value().trim().parse().unwrap_or(22);
+        let url = self
+            .cfg_url
+            .read(cx)
+            .value()
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
         let key_paste = self.cfg_key.read(cx).value().trim().to_string();
-        if host.is_empty() || user.is_empty() {
-            window.push_notification("❌ host / user 不能为空", cx);
+        if url.is_empty() || !url.starts_with("http") {
+            window.push_notification("❌ URL 要以 http(s):// 开头", cx);
             return;
         }
-        if !key_paste.is_empty() && !key_paste.contains("PRIVATE KEY") {
-            window.push_notification("❌ 私钥内容不对: 应为 -----BEGIN ... PRIVATE KEY----- 开头的整段", cx);
-            return;
-        }
-        let dir = app_config_dir();
-        if std::fs::create_dir_all(&dir).is_err()
-            || std::fs::write(
-                dir.join("holycrab.conf"),
-                format!("host={host}\nuser={user}\nport={port}\n"),
-            )
-            .is_err()
-        {
-            window.push_notification("❌ 写 holycrab.conf 失败", cx);
-            return;
-        }
-        if !key_paste.is_empty() {
-            let kp = dir.join("id_holycrab");
-            if std::fs::write(&kp, format!("{key_paste}\n")).is_err() {
-                window.push_notification("❌ 写私钥失败", cx);
+        let saved_key = parse_api_conf().map(|(_, k)| k).unwrap_or_default();
+        let key = if key_paste.is_empty() {
+            if saved_key.is_empty() {
+                window.push_notification("❌ key 为空且没有已保存的 key", cx);
                 return;
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(0o600));
-            }
+            saved_key
+        } else {
+            key_paste
+        };
+        let dir = app_config_dir();
+        if std::fs::create_dir_all(&dir).is_err()
+            || std::fs::write(dir.join("h3-api.conf"), format!("url={url}\nkey={key}\n")).is_err()
+        {
+            window.push_notification("❌ 写 h3-api.conf 失败", cx);
+            return;
         }
-        window.push_notification(format!("✅ 已保存 · {}", load_conn().short_label()), cx);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(
+                dir.join("h3-api.conf"),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        window.push_notification(format!("✅ 已保存 · {}", load_api().map(|a| a.short_label()).unwrap_or_default()), cx);
         cx.notify();
     }
 
     fn test_conn(&mut self, cx: &mut Context<Self>) {
-        let conn = load_conn();
-        self.conn_status = Some((true, "测连中…".into()));
+        let Some(api) = load_api() else {
+            self.api_status = Some((false, "❌ 未配置 — 先保存 URL + key".into()));
+            cx.notify();
+            return;
+        };
+        self.api_status = Some((true, format!("测连中… {}", api.base)));
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let dest = conn.dest.clone();
-            let r = smol::unblock(move || ssh_run(&conn, "echo ok")).await;
+            // 探一个不存在的成品名走 /outfile (取件就是这条通道):
+            // key 有效含 batch → 404 (查无此件); key 无效/缺 batch → 401/403
+            let base = api.base.clone();
+            let u = format!("{base}/api/h3/outfile?name=dynwall_conn_probe.mp4");
+            let r = smol::unblock(move || curl_code(&api, &u)).await;
             this.update(cx, |t, cx| {
-                t.conn_status = Some(match r {
-                    Ok(s) if s.trim() == "ok" => (true, format!("✅ {dest} 连通, 投批链路可用")),
-                    Ok(s) => (false, format!("❌ {dest} 异常回包: {}", s.trim())),
-                    Err(e) => (false, format!("❌ {dest}: {e}")),
+                t.api_status = Some(match r {
+                    Ok(404) => {
+                        (true, format!("✅ {base} 鉴权通过 (batch scope), 投批/取件链路可用"))
+                    }
+                    Ok(200) => (true, format!("✅ {base} 鉴权通过 (batch scope)")),
+                    Ok(code) if code == 401 || code == 403 => (
+                        false,
+                        format!("❌ key 无效或没有 batch 权限 (HTTP {code}); 投批/取件都要 batch"),
+                    ),
+                    Ok(code) => (false, format!("❌ {base} 异常回包 HTTP {code}")),
+                    Err(e) => (false, format!("❌ {e}")),
                 });
                 cx.notify();
             })
@@ -1375,10 +1368,8 @@ impl DynWall {
     }
 
     fn clear_conn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dir = app_config_dir();
-        let _ = std::fs::remove_file(dir.join("holycrab.conf"));
-        let _ = std::fs::remove_file(dir.join("id_holycrab"));
-        window.push_notification(format!("已清除 UI 凭据, 回退 {}", load_conn().mode_label()), cx);
+        let _ = std::fs::remove_file(app_config_dir().join("h3-api.conf"));
+        window.push_notification("已清除 API 凭据 — 生成前需重新配置", cx);
         cx.notify();
     }
 }
