@@ -14,6 +14,18 @@ set -euo pipefail
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/koi-wallpaper"
 mkdir -p "$STATE_DIR"
 
+# Try Omarchy / VirGL 虚机: EGL 配置匹配不上 (EGL_BAD_MATCH) → 软件 GL + 关硬解
+HWDEC=auto
+if systemd-detect-virt -q 2>/dev/null; then
+  export LIBGL_ALWAYS_SOFTWARE=1
+  HWDEC=no
+fi
+
+command -v mpvpaper >/dev/null 2>&1 || {
+  echo "mpvpaper 未安装 — 跑仓库里的 bin/install.sh (aarch64 源里没有此包, 脚本会源码编译)" >&2
+  exit 1
+}
+
 mons_all() {
   if command -v jq >/dev/null 2>&1; then
     hyprctl monitors -j | jq -r '.[].name'
@@ -49,7 +61,7 @@ do_on() {
   [ ${#mons[@]} -gt 0 ] || { echo "no monitors found" >&2; exit 1; }
   do_off >/dev/null
   for m in "${mons[@]}"; do
-    nohup mpvpaper -o "loop mute=yes panscan=1.0 hwdec=auto" "$m" "$video" \
+    nohup mpvpaper -o "loop mute=yes panscan=1.0 hwdec=$HWDEC" "$m" "$video" \
       >"$STATE_DIR/$m.log" 2>&1 &
     echo $! >"$STATE_DIR/$m.pid"
   done

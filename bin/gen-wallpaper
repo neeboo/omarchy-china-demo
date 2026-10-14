@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gen-wallpaper — live-demo loop: text prompt -> h3 render on the DGX farm ->
+# gen-wallpaper — live-demo loop: text prompt -> h3 render on the holycrab farm ->
 # pull back -> (optionally) make it a seamless loop -> push to a wallpaper box.
 #
 # usage:
@@ -19,7 +19,7 @@
 # pass is skipped automatically.
 set -euo pipefail
 
-DGX=${DGX_SSH:-dgx_spark}
+FARM=${FARM_SSH:-holycrab}
 FARM_DIR=/home/spark/h3_factory
 LOCAL_DIR="$HOME/dev/omarchy-china-demo/assets"
 PROMPT="" DUR=10 RATIO="16:9" PUSH="" DO_LOOP=1 TIMEOUT=1500 KEYFRAME=""
@@ -47,7 +47,7 @@ EXTRA_FIELDS=""
 if [ -n "$KEYFRAME" ]; then
   [ -f "$KEYFRAME" ] || { echo "no such keyframe: $KEYFRAME" >&2; exit 1; }
   KF_REMOTE="$FARM_DIR/inbox/kf_${ID}.png"
-  scp -q "$KEYFRAME" "$DGX:$KF_REMOTE"
+  scp -q "$KEYFRAME" "$FARM:$KF_REMOTE"
   DO_LOOP=0   # FL2VA returns to its opening frame; no crossfade needed
   EXTRA_FIELDS=", \"first_frame\": \"$KF_REMOTE\", \"last_frame\": \"$KF_REMOTE\",
  \"extra_lora\": \"Motion_Repair.safetensors\", \"extra_lora_strength\": 0.9"
@@ -55,7 +55,7 @@ if [ -n "$KEYFRAME" ]; then
 fi
 
 echo "[gen] queuing $ID (h3-fast-12, ${DUR}s, $RATIO) ..."
-ssh "$DGX" "cat > $FARM_DIR/inbox/60_${ID}.jsonl" <<EOF
+ssh "$FARM" "cat > $FARM_DIR/inbox/60_${ID}.jsonl" <<EOF
 {"id": "$ID", "project": "$PROJECT", "prompt": $JQ_PROMPT, "model": "h3-fast-12",
  "mp": 0.7, "dur": $DUR, "ratio": "$RATIO", "seed": $RANDOM$RANDOM, "raw": true, "sheet": false$EXTRA_FIELDS}
 EOF
@@ -64,9 +64,9 @@ echo "[gen] waiting for render (poll every 30 s, timeout ${TIMEOUT}s) ..."
 ELAPSED=0
 while true; do
   sleep 30; ELAPSED=$((ELAPSED + 30))
-  DONE=$(ssh "$DGX" "ls $FARM_DIR/out/ 2>/dev/null | grep -F '${PROJECT}_${ID}_' | grep '\.mp4$' | head -1" || true)
+  DONE=$(ssh "$FARM" "ls $FARM_DIR/out/ 2>/dev/null | grep -F '${PROJECT}_${ID}_' | grep '\.mp4$' | head -1" || true)
   [ -n "$DONE" ] && break
-  if ssh "$DGX" "grep -E 'REJECT|FAIL' $FARM_DIR/worker.log | grep -q '$ID'" 2>/dev/null; then
+  if ssh "$FARM" "grep -E 'REJECT|FAIL' $FARM_DIR/worker.log | grep -q '$ID'" 2>/dev/null; then
     echo "[gen] FAILED on farm — check worker.log for $ID" >&2; exit 2
   fi
   [ "$ELAPSED" -ge "$TIMEOUT" ] && { echo "[gen] TIMEOUT after ${TIMEOUT}s" >&2; exit 3; }
@@ -75,7 +75,7 @@ done
 echo "[gen] rendered: $DONE (${ELAPSED}s)"
 
 RAW="$LOCAL_DIR/${ID}_raw.mp4"
-scp -q "$DGX:$FARM_DIR/out/$DONE" "$RAW"
+scp -q "$FARM:$FARM_DIR/out/$DONE" "$RAW"
 echo "[gen] pulled -> $RAW"
 open -R "$RAW"   # reveal in Finder immediately (ship-renders rule)
 

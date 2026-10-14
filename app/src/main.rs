@@ -1,10 +1,12 @@
 // dynwall — 动态壁纸更换器 (gpui-kit)
 //
-// 画廊(CC0/自有 loop 素材) + 生成页(prompt → DGX h3 farm → 下载 → 本地 crossfade
+// 画廊(CC0/自有 loop 素材) + 生成页(prompt → holycrab h3 农场 → 下载 → 本地 crossfade
 // 循环化) + 自动轮换。渲染后端: Linux 走 mpvpaper/koi-wallpaper, macOS 用 mpv/open 预览。
 //
 // 素材库目录: ~/Videos/wallpapers + $DYNWALL_SEED_DIR (默认本仓库 assets/)。
-// 生成走 SSH 投批 (DYNWALL_DGX, 默认 dgx_spark), 复用 gen-wallpaper 的 inbox/out 链路。
+// 生成走 SSH 投批, 复用 gen-wallpaper 的 inbox/out 链路。连接凭据在「03 连接」页
+// 管理 (~/.config/dynwall/holycrab.conf + id_holycrab), 未配置时回退 ~/.ssh alias
+// (DYNWALL_FARM, 默认 holycrab; 旧 DYNWALL_DGX 仍兼容)。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -15,7 +17,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::base::h_flex;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
     label::Label,
     select::{Select, SelectState},
     separator::Separator,
@@ -36,8 +38,17 @@ const PROJECT: &str = "omarchy-demo";
 const POLL_SECS: u64 = 30;
 const GEN_TIMEOUT_SECS: u64 = 1500;
 
-fn dgx_host() -> String {
-    std::env::var("DYNWALL_DGX").unwrap_or_else(|_| "dgx_spark".into())
+// Linux 无 Menlo; noto-fonts-cjk 的 Mono 变体 Latin+CJK 一个字体全包, 免逐字回退
+#[cfg(target_os = "macos")]
+const UI_FONT: &str = "Menlo";
+#[cfg(not(target_os = "macos"))]
+const UI_FONT: &str = "Noto Sans Mono CJK SC";
+
+/// 未在「03 连接」配置时的回退 ssh alias (旧 env DYNWALL_DGX 仍兼容)。
+fn legacy_host() -> String {
+    std::env::var("DYNWALL_FARM")
+        .or_else(|_| std::env::var("DYNWALL_DGX"))
+        .unwrap_or_else(|_| "holycrab".into())
 }
 
 fn seed_dir() -> Option<PathBuf> {
@@ -57,6 +68,119 @@ fn thumb_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
         .join("dynwall/thumbs")
+}
+
+// ---------- holycrab 连接配置 (UI 管理, 凭据不进仓库) ----------
+
+fn app_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("dynwall")
+}
+
+/// holycrab.conf 三行: host= user= port=
+fn parse_holycrab_conf() -> Option<(String, String, u16)> {
+    let s = std::fs::read_to_string(app_config_dir().join("holycrab.conf")).ok()?;
+    let (mut host, mut user, mut port) = (String::new(), String::new(), 22u16);
+    for line in s.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        match k.trim() {
+            "host" => host = v.trim().into(),
+            "user" => user = v.trim().into(),
+            "port" => port = v.trim().parse().unwrap_or(22),
+            _ => {}
+        }
+    }
+    (!host.is_empty() && !user.is_empty()).then_some((host, user, port))
+}
+
+/// 解析后的 SSH 连接: 「03 连接」的显式配置优先, 否则回退 ~/.ssh alias。
+#[derive(Clone)]
+struct SshTarget {
+    dest: String,
+    explicit: bool,
+    key: Option<PathBuf>,
+    port: u16,
+    known_hosts: Option<PathBuf>,
+}
+
+impl SshTarget {
+    fn ssh_args(&self) -> Vec<String> {
+        let mut a: Vec<String> = vec!["-o".into(), "ConnectTimeout=10".into()];
+        if let Some(k) = &self.key {
+            a.extend(["-i".into(), k.to_string_lossy().into_owned()]);
+        }
+        if self.explicit {
+            a.extend(["-p".into(), self.port.to_string()]);
+            if let Some(kh) = &self.known_hosts {
+                a.extend([
+                    "-o".into(),
+                    format!("UserKnownHostsFile={}", kh.display()),
+                    "-o".into(),
+                    "StrictHostKeyChecking=accept-new".into(),
+                ]);
+            }
+        }
+        a.push(self.dest.clone());
+        a
+    }
+    fn scp_args(&self) -> Vec<String> {
+        let mut a: Vec<String> = vec!["-q".into()];
+        if let Some(k) = &self.key {
+            a.extend(["-i".into(), k.to_string_lossy().into_owned()]);
+        }
+        if self.explicit {
+            a.extend(["-P".into(), self.port.to_string()]);
+            if let Some(kh) = &self.known_hosts {
+                a.extend([
+                    "-o".into(),
+                    format!("UserKnownHostsFile={}", kh.display()),
+                    "-o".into(),
+                    "StrictHostKeyChecking=accept-new".into(),
+                ]);
+            }
+        }
+        a
+    }
+    /// 「03 连接」页的长状态。
+    fn mode_label(&self) -> String {
+        match (&self.explicit, &self.key) {
+            (true, Some(k)) => {
+                format!("EXPLICIT {}:{} · key ✓ {}", self.dest, self.port, k.display())
+            }
+            (true, None) => format!("EXPLICIT {}:{} · 无 key, 走本机默认私钥", self.dest, self.port),
+            (false, _) => format!("LEGACY ~/.ssh alias {} (未在 UI 配置)", self.dest),
+        }
+    }
+    /// 状态栏短状态。
+    fn short_label(&self) -> String {
+        match self.key {
+            Some(_) => format!("{} 🔑", self.dest),
+            None => self.dest.clone(),
+        }
+    }
+}
+
+fn load_conn() -> SshTarget {
+    if let Some((host, user, port)) = parse_holycrab_conf() {
+        let key = app_config_dir().join("id_holycrab");
+        return SshTarget {
+            dest: format!("{user}@{host}"),
+            explicit: true,
+            key: key.is_file().then_some(key),
+            port,
+            known_hosts: Some(app_config_dir().join("known_hosts")),
+        };
+    }
+    SshTarget {
+        dest: legacy_host(),
+        explicit: false,
+        key: None,
+        port: 22,
+        known_hosts: None,
+    }
 }
 
 // ---------- 极客风主题 (phosphor terminal) ----------
@@ -84,9 +208,9 @@ fn hack_theme(cx: &mut gpui_kit::App) {
     Theme::update(cx, |t| {
         t.radius = px(2.);
         t.radius_lg = px(3.);
-        t.font_family = "Menlo".into();
+        t.font_family = UI_FONT.into();
         t.font_size = px(13.);
-        t.mono_font_family = "Menlo".into();
+        t.mono_font_family = UI_FONT.into();
         t.mono_font_size = px(12.);
         t.shadow = false;
         t.focus_ring = false;
@@ -251,20 +375,62 @@ fn probe_meta(video: &Path) -> Option<String> {
 
 // ---------- 应用上墙 / 预览 ----------
 
+/// PATH 里找可执行文件。spawn 只报"文件不存在", 分不清"没装"和"装哪了", 先自查。
+fn have(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// Try Omarchy / VirGL 虚机里 EGL 配置匹配不上 (EGL_BAD_MATCH) —
+/// 软件 GL + 关硬解绕过; 裸金属不受影响。
+fn in_vm() -> bool {
+    Command::new("systemd-detect-virt")
+        .arg("-q")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// 上墙: Linux → koi-wallpaper (mpvpaper); macOS → mpv 循环 / open 兜底。
 fn apply_wallpaper(video: &Path) -> anyhow::Result<()> {
     let v = video.to_string_lossy().into_owned();
     #[cfg(target_os = "linux")]
     {
-        let ok = Command::new("koi-wallpaper").arg("on").arg(&v).spawn().is_ok();
-        if !ok {
-            Command::new("mpvpaper")
-                .args(["-o", "loop mute=yes panscan=1.0 hwdec=auto"])
-                .arg("*")
-                .arg(&v)
-                .spawn()?;
+        let vm = in_vm();
+        // koi-wallpaper 依赖 mpvpaper, 不在就直接走下面兜底 (不然它后台静默失败)
+        if have("koi-wallpaper") && have("mpvpaper") {
+            if Command::new("koi-wallpaper").arg("on").arg(&v).spawn().is_ok() {
+                return Ok(());
+            }
         }
-        Ok(())
+        if have("mpvpaper") {
+            let mut cmd = Command::new("mpvpaper");
+            if vm {
+                cmd.env("LIBGL_ALWAYS_SOFTWARE", "1");
+                cmd.args(["-o", "loop mute=yes panscan=1.0 hwdec=no"]);
+            } else {
+                cmd.args(["-o", "loop mute=yes panscan=1.0 hwdec=auto"]);
+            }
+            if cmd.arg("*").arg(&v).spawn().is_ok() {
+                return Ok(());
+            }
+        }
+        // mpv 全屏兜底 (窗口层, 非壁纸层, 但至少能看到); VM 里走 X11 输出, 完全不碰 EGL
+        let mut mpv = Command::new("mpv");
+        if vm {
+            mpv.env("LIBGL_ALWAYS_SOFTWARE", "1")
+                .args(["--hwdec=no", "--vo=x11"]);
+        }
+        if mpv
+            .args(["--loop=inf", "--really-quiet", "--fullscreen"])
+            .arg(&v)
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        anyhow::bail!("缺播放器 — 跑仓库里的 bin/install.sh 一键装 (或 sudo pacman -S mpv)");
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -290,20 +456,18 @@ fn stop_wallpaper() {
 
 // ---------- SSH 投批链路 (与 gen-wallpaper 同路) ----------
 
-fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<String> {
-    let out = Command::new("ssh")
-        .args(["-o", "ConnectTimeout=10", host, cmd])
-        .output()?;
+fn ssh_run(t: &SshTarget, cmd: &str) -> anyhow::Result<String> {
+    let out = Command::new("ssh").args(t.ssh_args()).arg(cmd).output()?;
     if !out.status.success() {
-        anyhow::bail!("ssh {}: {}", host, String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!("ssh {}: {}", t.dest, String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn ssh_write_manifest(host: &str, remote: &str, content: &str) -> anyhow::Result<()> {
+fn ssh_write_manifest(t: &SshTarget, remote: &str, content: &str) -> anyhow::Result<()> {
     use std::io::Write as _;
     let mut child = Command::new("ssh")
-        .arg(host)
+        .args(t.ssh_args())
         .arg(format!("cat > {remote}"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -321,9 +485,11 @@ fn ssh_write_manifest(host: &str, remote: &str, content: &str) -> anyhow::Result
     Ok(())
 }
 
-fn scp_pull(host: &str, remote: &str, local: &Path) -> anyhow::Result<()> {
+fn scp_pull(t: &SshTarget, remote: &str, local: &Path) -> anyhow::Result<()> {
     let out = Command::new("scp")
-        .args(["-q", &format!("{host}:{remote}"), &local.to_string_lossy()])
+        .args(t.scp_args())
+        .arg(format!("{}:{remote}", t.dest))
+        .arg(local.to_string_lossy().as_ref())
         .output()?;
     if !out.status.success() {
         anyhow::bail!("scp pull: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -415,6 +581,11 @@ struct DynWall {
     rotate: bool,
     rotate_min: Entity<SelectState<Vec<&'static str>>>,
     rotate_tick: u64,
+    cfg_host: Entity<InputState>,
+    cfg_user: Entity<InputState>,
+    cfg_port: Entity<InputState>,
+    cfg_key: Entity<TextareaState>,
+    conn_status: Option<(bool, String)>,
 }
 
 impl DynWall {
@@ -437,6 +608,19 @@ impl DynWall {
         let rotate_min = cx.new(|cx| {
             SelectState::new(vec!["1", "3", "5", "10", "30"], Some(IndexPath::new(2)), window, cx)
         });
+        // 「03 连接」预填: 已保存配置 > demo 默认值
+        let (ch, cu, cp) = parse_holycrab_conf()
+            .unwrap_or_else(|| ("192.168.1.227".into(), "spark".into(), 22));
+        let cfg_host =
+            cx.new(|cx| InputState::new(window, cx).default_value(ch).placeholder("192.168.1.227"));
+        let cfg_user =
+            cx.new(|cx| InputState::new(window, cx).default_value(cu).placeholder("spark"));
+        let cfg_port =
+            cx.new(|cx| InputState::new(window, cx).default_value(cp.to_string()).placeholder("22"));
+        let cfg_key = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("粘贴 OpenSSH 私钥 (-----BEGIN ... PRIVATE KEY----- 整段)。留空 = 沿用已保存的 key")
+        });
         let this = Self {
             tab_ix: 0,
             entries,
@@ -450,6 +634,11 @@ impl DynWall {
             rotate: false,
             rotate_min,
             rotate_tick: 0,
+            cfg_host,
+            cfg_user,
+            cfg_port,
+            cfg_key,
+            conn_status: None,
         };
 
         // 封面帧 + 元数据后台补齐
@@ -576,14 +765,14 @@ impl DynWall {
         self.gen = Some(GenJob { id: id.clone(), phase: GenPhase::Submitting, started: Instant::now() });
         cx.notify();
 
-        let host = dgx_host();
+        let conn = load_conn();
         cx.spawn(async move |this, cx| {
             // 1) 投批
             let remote_manifest = format!("{FARM_DIR}/inbox/60_{id}.jsonl");
-            let host0 = host.clone();
+            let conn0 = conn.clone();
             let r = smol::unblock({
                 let id = id.clone();
-                move || ssh_write_manifest(&host0, &remote_manifest, &manifest)
+                move || ssh_write_manifest(&conn0, &remote_manifest, &manifest)
                     .map(|_| id)
             })
             .await;
@@ -614,13 +803,13 @@ impl DynWall {
                 waited += POLL_SECS;
                 let probe = smol::unblock({
                     let id = id.clone();
-                    let host = host.clone();
+                    let conn = conn.clone();
                     move || {
-                        ssh_run(&host,
+                        ssh_run(&conn,
                             &format!("ls {FARM_DIR}/out/ 2>/dev/null | grep -F '{PROJECT}_{id}_' | grep '\\.mp4$' | head -1"))
                             .or_else(|_| {
                                 // 区分失败: worker 判退/失败记日志
-                                ssh_run(&host,
+                                ssh_run(&conn,
                                     &format!("grep -E 'REJECT|FAIL' {FARM_DIR}/worker.log | grep -F '{id}' | head -1"))
                                     .map(|_| "__failed__".to_string())
                             })
@@ -668,8 +857,8 @@ impl DynWall {
             if let Err(e) = smol::unblock({
                 let product = product.clone();
                 let raw = raw.clone();
-                let host = host.clone();
-                move || scp_pull(&host, &format!("{FARM_DIR}/out/{product}"), &raw)
+                let conn = conn.clone();
+                move || scp_pull(&conn, &format!("{FARM_DIR}/out/{product}"), &raw)
             })
             .await
             {
@@ -753,11 +942,13 @@ impl Render for DynWall {
                 cx.notify();
             }))
             .child(Tab::new().label("01 画廊"))
-            .child(Tab::new().label("02 生成"));
+            .child(Tab::new().label("02 生成"))
+            .child(Tab::new().label("03 连接"));
 
         let body = match self.tab_ix {
             0 => self.render_gallery(window, cx).into_any_element(),
-            _ => self.render_generate(cx).into_any_element(),
+            1 => self.render_generate(cx).into_any_element(),
+            _ => self.render_conn(cx).into_any_element(),
         };
 
         // TUI 状态栏
@@ -792,9 +983,9 @@ impl Render for DynWall {
                 div()
                     .text_color(hx(C_DIM))
                     .child(format!(
-                        "{} ASSETS · DGX {} · {} · DYNWALL v0.1",
+                        "{} ASSETS · {} · {} · DYNWALL v0.2",
                         self.entries.len(),
-                        dgx_host(),
+                        load_conn().short_label(),
                         rotate_txt
                     )),
             );
@@ -803,7 +994,7 @@ impl Render for DynWall {
             .size_full()
             .flex()
             .flex_col()
-            .font_family("Menlo")
+            .font_family(UI_FONT)
             .bg(hx(C_BG))
             .text_color(hx(C_FG))
             .child(
@@ -1037,11 +1228,158 @@ impl DynWall {
                 Label::new(format!("$ {s}")).text_size(px(12.)).text_color(color)
             }))
             .child(
-                Label::new("// SSH 投批 → DGX inbox → 轮询 out/ → scp 拉回 → crossfade → 自动入库")
+                Label::new("// 投批 → 农场 inbox → 轮询 out/ → 拉回 → crossfade → 自动入库 (连接在「03 连接」配)")
                     .text_size(px(10.5))
                     .text_color(hx(C_DIM)),
             )
             .text_color(theme.foreground)
+    }
+
+    fn render_conn(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let conn = load_conn();
+        v_flex()
+            .p_4()
+            .gap_2()
+            .max_w(px(680.))
+            .child(
+                Label::new("HOLYCRAB SSH ▸ 生成投批用的连接凭据 (存本机 ~/.config/dynwall/, 不进仓库)")
+                    .text_size(px(12.))
+                    .text_color(hx(C_DIM)),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Label::new("HOST").text_size(px(12.)).text_color(hx(C_DIM)))
+                    .child(Input::new(&self.cfg_host).w(px(180.)))
+                    .child(Label::new("USER").text_size(px(12.)).text_color(hx(C_DIM)))
+                    .child(Input::new(&self.cfg_user).w(px(110.)))
+                    .child(Label::new("PORT").text_size(px(12.)).text_color(hx(C_DIM)))
+                    .child(Input::new(&self.cfg_port).w(px(72.))),
+            )
+            .child(
+                Label::new("PRIVATE KEY ▸ 贴入 OpenSSH 私钥; 留空则沿用已保存的 key")
+                    .text_size(px(12.))
+                    .text_color(hx(C_DIM)),
+            )
+            .child(Textarea::new(&self.cfg_key).h(px(190.)))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("save-conn")
+                            .primary()
+                            .label("保存凭据")
+                            .with_size(Size::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_conn(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("test-conn")
+                            .label("测连")
+                            .with_size(Size::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.test_conn(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("clear-conn")
+                            .danger()
+                            .label("清除")
+                            .with_size(Size::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.clear_conn(window, cx);
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Label::new(format!("MODE ▸ {}", conn.mode_label()))
+                            .text_size(px(10.5))
+                            .text_color(hx(C_AMBER)),
+                    ),
+            )
+            .children(self.conn_status.clone().map(|(ok, s)| {
+                Label::new(format!("$ {s}"))
+                    .text_size(px(12.))
+                    .text_color(if ok { hx(C_ACCENT) } else { hx(C_DANGER) })
+            }))
+            .child(
+                Label::new("// 保存后「02 生成」即走此凭据; VM/新机器无需再拷 ~/.ssh")
+                    .text_size(px(10.5))
+                    .text_color(hx(C_DIM)),
+            )
+            .text_color(theme.foreground)
+    }
+
+    fn save_conn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let host = self.cfg_host.read(cx).value().trim().to_string();
+        let user = self.cfg_user.read(cx).value().trim().to_string();
+        let port: u16 = self.cfg_port.read(cx).value().trim().parse().unwrap_or(22);
+        let key_paste = self.cfg_key.read(cx).value().trim().to_string();
+        if host.is_empty() || user.is_empty() {
+            window.push_notification("❌ host / user 不能为空", cx);
+            return;
+        }
+        if !key_paste.is_empty() && !key_paste.contains("PRIVATE KEY") {
+            window.push_notification("❌ 私钥内容不对: 应为 -----BEGIN ... PRIVATE KEY----- 开头的整段", cx);
+            return;
+        }
+        let dir = app_config_dir();
+        if std::fs::create_dir_all(&dir).is_err()
+            || std::fs::write(
+                dir.join("holycrab.conf"),
+                format!("host={host}\nuser={user}\nport={port}\n"),
+            )
+            .is_err()
+        {
+            window.push_notification("❌ 写 holycrab.conf 失败", cx);
+            return;
+        }
+        if !key_paste.is_empty() {
+            let kp = dir.join("id_holycrab");
+            if std::fs::write(&kp, format!("{key_paste}\n")).is_err() {
+                window.push_notification("❌ 写私钥失败", cx);
+                return;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        window.push_notification(format!("✅ 已保存 · {}", load_conn().short_label()), cx);
+        cx.notify();
+    }
+
+    fn test_conn(&mut self, cx: &mut Context<Self>) {
+        let conn = load_conn();
+        self.conn_status = Some((true, "测连中…".into()));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let dest = conn.dest.clone();
+            let r = smol::unblock(move || ssh_run(&conn, "echo ok")).await;
+            this.update(cx, |t, cx| {
+                t.conn_status = Some(match r {
+                    Ok(s) if s.trim() == "ok" => (true, format!("✅ {dest} 连通, 投批链路可用")),
+                    Ok(s) => (false, format!("❌ {dest} 异常回包: {}", s.trim())),
+                    Err(e) => (false, format!("❌ {dest}: {e}")),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn clear_conn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = app_config_dir();
+        let _ = std::fs::remove_file(dir.join("holycrab.conf"));
+        let _ = std::fs::remove_file(dir.join("id_holycrab"));
+        window.push_notification(format!("已清除 UI 凭据, 回退 {}", load_conn().mode_label()), cx);
+        cx.notify();
     }
 }
 
