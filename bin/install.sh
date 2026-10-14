@@ -18,12 +18,15 @@ ARCH="$(uname -m)"
 say "omarchy demo 安装 (${ARCH})"
 
 # ---- 1) 系统依赖 ----
+# --ask 4 = 自动对 ":: Do you want to skip the above package?" 答 yes,
+#           跳过依赖装不上的包 (Omarchy 镜像不同步时 hyprland-guiutils 常见)
+PKGS=(base-devel git meson ninja mpv ffmpeg jq fontconfig
+      noto-fonts-cjk pkgconf wayland wayland-protocols)
 say "安装系统依赖 (pacman, 全量升级)…"
-sudo pacman -Syu --needed --noconfirm \
-  base-devel git meson ninja \
-  mpv ffmpeg jq fontconfig \
-  noto-fonts-cjk pkgconf \
-  wayland wayland-protocols
+if ! sudo pacman -Syu --needed --noconfirm --ask 4 "${PKGS[@]}"; then
+  warn "全量升级有依赖冲突 (Omarchy 包不同步, 与本 demo 无关) — 降级为只装需要的包"
+  sudo pacman -Sy --needed --noconfirm "${PKGS[@]}"
+fi
 
 # ---- 2) mpvpaper: 官方源只有 x86_64, aarch64 自动源码编译 ----
 if command -v mpvpaper >/dev/null 2>&1; then

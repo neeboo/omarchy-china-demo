@@ -8,6 +8,12 @@ BIN="$REPO/app/target/release/dynwall"
 
 [ -x "$BIN" ] || { echo "app 未编译 — 先跑 bin/install.sh" >&2; exit 1; }
 
+# Try Omarchy / VirGL: EGL 创建失败 (EGL_BAD_MATCH) — 整个会话走软件 GL
+if systemd-detect-virt -q 2>/dev/null; then
+  export LIBGL_ALWAYS_SOFTWARE=1
+  echo "虚机环境: 已启用软件 GL (VirGL EGL 不可用)"
+fi
+
 # 保底素材先上墙 (有 koi-wallpaper 才挂; 没有就 app 里手动上)
 LOOP="$(ls "$REPO"/assets/koi_loop*.mp4 2>/dev/null | head -1 || true)"
 if [ -n "$LOOP" ] && command -v koi-wallpaper >/dev/null 2>&1; then
